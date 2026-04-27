@@ -1,0 +1,9 @@
+nv_memtest64
+priv_check
+nv_memtest
+nv_probe
+nv_gsp_status
+cmd_reg_on
+ec_probe
+nv_vram_check
+nv_load_gsp
