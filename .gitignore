@@ -18,3 +18,4 @@ nv_gsp_pulse
 nv_gpu_open_valves
 nv_gsp_force
 nv_gsp_status
+nv_gsp_wake
