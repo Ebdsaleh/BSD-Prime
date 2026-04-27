@@ -7,3 +7,14 @@ cmd_reg_on
 ec_probe
 nv_vram_check
 nv_load_gsp
+ignite.csh
+nv_pci_wake
+nv_pci_gsp_wake
+nv_pmc_full_audit
+nv_gpu_repin
+nv_falcon_test
+nv_falcon_find
+nv_gsp_pulse
+nv_gpu_open_valves
+nv_gsp_force
+nv_gsp_status

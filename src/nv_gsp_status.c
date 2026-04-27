@@ -17,11 +17,18 @@
 
 #define NV_PGSP_BASE            0x00110000
 #define NV_PGSP_FALCON_CPUCTL   (NV_PGSP_BASE + 0x200)
-#define NV_PGSP_FALCON_IDELCTL  (NV_PGSP_BASE + 0x204)
+#define NV_PGSP_FALCON_IDLECTL  (NV_PGSP_BASE + 0x204)
 #define NV_PGSP_FALCON_STATUS   (NV_PGSP_BASE + 0x214)
 #define NV_PGSP_FALCON_BOOTADDR (NV_PGSP_BASE + 0x240)
 #define NV_PGSP_FALCON_MAILBOX0 (NV_PGSP_BASE + 0x040)
 #define NV_PGSP_FALCON_MAILBOX1 (NV_PGSP_BASE + 0x044)
+
+/* Falcon Status Bit Definitions */
+#define FALCON_STATUS_IDLE      (1 << 0)
+#define FALCON_STATUS_HALTED    (1 << 1)
+#define FALCON_STATUS_VALID     (1 << 2)
+
+
 
 int main() {
     int mem_fd;
@@ -51,40 +58,36 @@ int main() {
     /* 3. Read Status Registers */
     uint32_t status     = *(volatile uint32_t *)(regs + NV_PGSP_FALCON_STATUS);
     uint32_t cpuctl     = *(volatile uint32_t *)(regs + NV_PGSP_FALCON_CPUCTL);
-    uint32_t mailbox    = *(volatile uint32_t *)(regs + NV_PGSP_FALCON_MAILBOX0);
+    uint32_t idlectl    = *(volatile uint32_t *)(regs + NV_PGSP_FALCON_IDLECTL);
     uint32_t boot       = *(volatile uint32_t *)(regs + NV_PGSP_FALCON_BOOTADDR);
+    uint32_t mbox0      = *(volatile uint32_t *)(regs + NV_PGSP_FALCON_MAILBOX0);
+    uint32_t mbox1      = *(volatile uint32_t *)(regs + NV_PGSP_FALCON_MAILBOX1);
 
-    printf("GSP Falcon Status:      0x%08x\n", status);
-    printf("GSP CPU Control:        0x%08x\n", cpuctl);
-    printf("GSP Boot Address:       0x%08x\n", boot);
-    printf("GSP Mailbox 0:          0x%08x\n", mailbox);
+    printf("==========================================================\n");
+    printf("CORE STATUS:      0x%08x | CPU CONTROL:  0x%08x\n", status, cpuctl);
+    printf("IDLE CONTROL:     0x%08x | BOOT ADDRESS: 0x%08x\n", idlectl, boot);
+    printf("MAILBOX 0 (CMD):  0x%08x | MAILBOX 1 (RET): 0x%08x\n", mbox0, mbox1);
     printf("----------------------------------------------------------\n");
 
-    /* 4. The Architect's Interpretation */
-    printf("Analysis: ");
-
-    // Check if the GSP is halted
-    if (status & 0x2) {
-        printf("GSP is currently HALTED.\n");
-    } else {
-        printf("GSP is currently RUNNING or BUSY.\n");
-    }
+   /* Granular Bit Analysis */
+    printf("BIT ANALYSIS:\n");
+    printf("  [ ] CPU HALTED:    %s\n", (status & FALCON_STATUS_HALTED) ? "YES" : "NO");
+    printf("  [ ] ENGINE IDLE:   %s\n", (status & FALCON_STATUS_IDLE)   ? "YES" : "NO");
+    printf("  [ ] STATUS VALID:  %s\n", (status & FALCON_STATUS_VALID)  ? "YES" : "NO");
+    printf("----------------------------------------------------------\n");
     
-    // Check if GSP has initated a handshake (Mailbox 0 often holds status)
-    if (mailbox == 0x0) {
-        printf("Mailbox is empty. No firmware has been loaded yet.\n");
-
-    } else if (mailbox == 0xFFFFFFFF) {
-        printf("Mailbox read returned noise. Is the GSP Powered yet?\n");
-
+    /* Interpretation */
+    printf("NOTES: ");
+    if (!(status & FALCON_STATUS_IDLE) && (mbox0 == 0)) {
+        printf("GSP is BUSY but Mailbox is empty. This often indicates the\n");
+        printf("               VBIOS is still initializing the Falcon core.\n");
+    } else if (status & FALCON_STATUS_HALTED) {
+        printf("GSP is HALTED, This is the ideal state for a new firmware load.\n");
     } else {
-        printf("Mailbox contains data (0x%08x). Possible firmware signature.\n", mailbox);
-
+        printf("GSP is ACTIVE. Manual reset may be required via CPUCTL.\n");
     }
 
-    /* 5. Cleanup */
     munmap(map_base, MAP_SIZE);
     close(mem_fd);
-
     return EXIT_SUCCESS;
 }
