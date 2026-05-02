@@ -1,119 +1,130 @@
 /* src/nv_load_gsp.c  */
-#include <sys/types.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 
+/* Use our organized hardware headers */
+#include "api/prime.h"
+#include "api/hardware_profile.h"
+#include "dev/turing_gsp.h"
+#include "dev/turing_pmc.h"
 
-// gsp filepath: /etc/firmware/nouveau/tu104/gsp/gsp.bin
-#define GSP_FIRMWARE_PATH "/etc/firmware/nouveau/tu104/gsp/gsp.bin"
-#define NV_BAR0_PHYS 0xac000000
-#define NV_BAR1_PHYS 0x80000000
-#define VRAM_APERTURE_SIZE (256 * 1024 * 1024)
-
-/* GSP Landing Pad: 128MB offset in BAR1 (Safe from the 256MB Wall) */
-#define GSP_VRAM_OFFSET 0x08000000
-
-/* GPS Falcon Registers */
-#define NV_PGSP_BASE            0x00110000
-#define NV_PGSP_FALCON_CPUCTL   (NV_PGSP_BASE + 0x100)
-#define NV_PGSP_FALCON_STATUS   (NV_PGSP_BASE + 0x114)
-#define NV_PGSP_FALCON_BOOTADDR (NV_PGSP_BASE + 0x140)
 
 
 int main() {
-    int mem_fd, fw_fd;
-    struct stat st;
-    void *bar0, *bar1_pad;
-    uint8_t *fw_buffer;
+    struct stat firmware_stats;
+    uint32_t *gpu_bar0_map;
+    uint32_t *gpu_vram_map;
+    uint8_t *firmware_system_buffer;
 
-    printf("System GSP Injection Sequence Initiated\n");
-    printf("----------------------------------------------------------\n");
+    /* Create the Manifest for the VRAM to receive. */
+    Gsp_Fw_Wpr_Meta manifest;
+    
+    printf("[*] GSP Injection: Starting clean hardware bring-up...\n");
 
-    /* 1. Load Firmware from Disk to System RAM */
-    fw_fd = open(GSP_FIRMWARE_PATH, O_RDONLY);
-    if (fw_fd < 0) {perror("Failed to open gsp.bin"); return 1;}
-    fstat(fw_fd, &st);
+    /* 1. Map BAR0 using the verified address from our ghost probe */
+    gpu_bar0_map = (uint32_t *)map_physical_memory(0xAD000000, 0x200000);
+    if (!gpu_bar0_map) return 1;
+    
 
-    /* Safety Check */
-    if (GSP_VRAM_OFFSET + st.st_size > VRAM_APERTURE_SIZE) {
-        fprintf(stderr, "Error: Firmware (%.2f MiB) + Offset exceeds Aperture!\n",
-                (float)st.st_size / 1024 / 1024);
+    /* 2. THE DEEP SCRUB: Sequential Partition Reset */
+    printf("[*] Performing Deep Scrub to clear 0xBADF lockout...\n");
+
+    /* A. FORCE ISOLATION: Put the unit in reset BEFORE disabling power */
+    gpu_bar0_map[NV_PMC_DEVICE_RESET / 4] &= ~NV_PMC_GSP_ENABLE_BIT; // Hold Reset (Bit 31)
+    usleep(50000);
+
+    /* B. POWER DOWN: Kill the Master Toggles */
+    gpu_bar0_map[NV_PMC_DEVICE_ENABLE / 4]   &= ~NV_PMC_GSP_ENABLE_BIT; 
+    gpu_bar0_map[NV_PMC_DEVICE_ENABLE_2 / 4] &= ~NV_PMC_GSP_ENABLE_BIT; 
+    usleep(200000); // 200ms "Cold Sleep"
+
+    /* C. POWER UP: Re-electrify the gates while STILL in reset */
+    gpu_bar0_map[NV_PMC_DEVICE_ENABLE / 4]   |= NV_PMC_GSP_ENABLE_BIT;
+    gpu_bar0_map[NV_PMC_DEVICE_ENABLE_2 / 4] |= NV_PMC_GSP_ENABLE_BIT;
+    usleep(50000);
+
+    /* D. RELEASE RESET: Finally let the logic gates flow */
+    gpu_bar0_map[NV_PMC_DEVICE_RESET / 4]    |= NV_PMC_GSP_ENABLE_BIT;
+    usleep(50000);
+
+    /* E. BRIDGE BYPASS: Re-insert the Golden Key */
+    gpu_bar0_map[0x0000121C / 4] = 0x00000001; 
+    gpu_bar0_map[REG_PMC_ELCG_DIS / 4] = 0xFFFFFFFF; // Disable Clock Gating    
+
+
+
+    /* 3. Pulse Check: Informative only, do not Abort */
+    uint32_t status = gpu_bar0_map[NV_PMC_HOST_UPPER_BRIDGE / 4];
+    printf("[*] Host Bridge Readback (0x210): 0x%08x\n", status);
+
+    if (status == 0xBADF5040) {
+        printf("[!] Bridge reports BAD FEED, but checking Falcon mailboxes for life...\n");
+        // Force a read of the Falcon ID to see if the bridge is actually open
+        uint32_t falcon_id = gpu_bar0_map[0x00110000 / 4]; 
+        if (falcon_id != 0xBADF5040 && falcon_id != 0xFFFFFFFF) {
+            printf("[+] Falcon ID detected: 0x%08x. Bridge is OPEN. Proceeding!\n", falcon_id);
+        } else {
+            printf("[-] Falcon is unreachable. Lockout is real.\n");
+            // Only return 1 here if the Falcon ID itself is BADF
+            return 1; 
+        }
     }
 
     
-    fw_buffer = malloc(st.st_size);
-    read(fw_fd, fw_buffer, st.st_size);
-    close(fw_fd);
-    printf("Step 1: Loaded %lld bytes of GSP firmware into RAM.\n", (long long)st.st_size);
+    /* 4. Load Firmware and Manifest */
+    FILE *firmware_file = fopen("/etc/firmware/nouveau/tu104/gsp/gsp.bin", "rb");
+    if (!firmware_file) return 1;
+    fstat(fileno(firmware_file), &firmware_stats);
+    firmware_system_buffer = malloc(firmware_stats.st_size);
+    fread(firmware_system_buffer, 1, firmware_stats.st_size, firmware_file);
+    fclose(firmware_file);
 
-    /* 2. Map BARs 
-     * Map BAR0 and BAR1 Landing Pad */
-    mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-    bar0 = mmap(NULL, 0x200000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, NV_BAR0_PHYS);
+    // Prepare the Manifest
+    memset(&manifest, 0, sizeof(manifest));
+    manifest.magic = 0xdc3aae21371a60b3ULL;
+    manifest.revision = 1;
 
-    // We only need to map the portion of BAR1 where we are landing the firmware
-    bar1_pad = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-            mem_fd, NV_BAR1_PHYS + GSP_VRAM_OFFSET );
 
-    if (bar0 == MAP_FAILED || bar1_pad == MAP_FAILED) {
-        perror("map failed"); return 1;
-    }
+    // GPS Coordinates: Base 0x80000000 + Offset 0x08001000 = 0x88001000
+    manifest.sysmem_addr_of_radix3_elf = 0x88001000;
+    manifest.sizeof_radix3_elf = firmware_stats.st_size; // Ensure this is > 0
+    manifest.sysmem_addr_of_bootloader = 0x88001000;
+    manifest.verified = 0xa0a0a0a0a0a0a0a0ULL;
 
-    /* 3. Inject Firmware into VRAM */
-    printf("Step 2: Injecting firmware into VRAM at offset 0x%x...\n", GSP_VRAM_OFFSET);
-    memcpy(bar1_pad, fw_buffer, st.st_size);
+    // Map a slightly larger area to fit both (Manifest + Firmware)
+    gpu_vram_map = (uint32_t *)map_physical_memory(0x88000000, firmware_stats.st_size + 0x1000);
 
-    // Verify a few bytes to ensure the transfer wasn't "munted".
-    if (memcmp(bar1_pad, fw_buffer, 64) == 0) {
-        printf("Step 3: Transfer verified. Silicon has the binary.\n");
-    } else {
-        printf("CRITICAL ERROR: VRAM transfer corruption!\n");
-        return 1;
+    // Copy Manifest to 0x88000000
+    memcpy(gpu_vram_map, &manifest, sizeof(manifest));
 
-    }
-
+    // Copy Firmware to 0x88001000 (Room B)
+    memcpy((uint8_t*)gpu_vram_map + 0x1000, firmware_system_buffer, firmware_stats.st_size);
     
-    /* 4. The Handshake: Point and Shoot */
-    printf("Step 4: Preparing the Falcon...\n");
 
-
-    volatile uint32_t *regs = (volatile uint32_t *)bar0;
+    /* 5. Point and Shoot Handshake */
+    printf("[*] Executing RISC-V Handshake...\n");
     
-    // A. Force Halt/Reset first (Ensure a clean state).
-    regs[NV_PGSP_FALCON_CPUCTL / 4] = 0x2;
-    usleep(1000);
-    
-    // B. Calculate the Internal shifted address.
-    // THE GSP see VRAM  starting at 0, so the pointer is just the OFFSET.
-    // Falcon requires this to be right-shifted by 8.
-    uint32_t internal_shifted_address = GSP_VRAM_OFFSET >> 8;
+    // Tell GSP where the Manifest GPS coordinate is
+    gpu_bar0_map[NV_PGSP_FALCON_MAILBOX0 / 4] = 0x88000000; // Lower bits
+    gpu_bar0_map[NV_PGSP_FALCON_MAILBOX1 / 4] = 0x00000000; // Upper bits
 
-    printf("Step 5: Setting the Internal Boot Pointer to 0x%08x (Shifted: 0x%x)\n",
-            GSP_VRAM_OFFSET, internal_shifted_address);
+    // Set RISC-V Version to satisfy kernel_gsp_tu102.c
+    gpu_bar0_map[NV_PGSP_FALCON_OS / 4] = 0x1;
+
+    // Execute
+    gpu_bar0_map[NV_PGSP_FALCON_CPUCTL / 4] = 0x1;
 
 
-    regs[NV_PGSP_FALCON_BOOTADDR / 4] = internal_shifted_address;
-    
-    // C. Kick the Falcon into Start mode
+    /*Cleanup */
+    unmap_physical_memory(gpu_bar0_map, 0x200000);
+    unmap_physical_memory(gpu_vram_map, firmware_stats.st_size + 0x1000);
+    free(firmware_system_buffer);
 
-    printf("Step 6: Releasing the Falcon (START)...\n");
-    regs[NV_PGSP_FALCON_CPUCTL / 4] = 0x1;
-
-    printf("----------------------------------------------------------\n");
-    printf("Injection complete. Run 'nv_gsp_status' to check for a pulse.\n");
-
-    /* Cleanup */
-    munmap(bar0, 0x200000);
-    munmap(bar1_pad, st.st_size);
-    close(mem_fd);
-    free(fw_buffer);
-
+    printf("[+] GSP Load Sequence Complete. Check scratch mailboxes at 0x110804.\n");
     return 0;
 }
