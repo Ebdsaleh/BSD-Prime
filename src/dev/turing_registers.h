@@ -21,12 +21,7 @@ RegisterMap dictionary[] = {
     {NULL, 0} // Sentinel to mark end of array
 };
 
-/* Formal registry for the help system and IntelliSense */
-const char *command_list[] = {
-    "peek", "poke", "fill", "until", "clear", 
-    "script", "help", "wait", "repeat", "log", "exit", 
-    NULL 
-};
+
 
 #endif      /* #define SALIX_DEV_TURING_REGISTERS_H */
 
