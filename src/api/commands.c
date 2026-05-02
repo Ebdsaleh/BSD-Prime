@@ -16,6 +16,7 @@ void cmd_help(Prime_Shell *shell, int argc, char **argv);
 
 
 
+
 uint32_t resolve_name(Prime_Shell *shell, const char *name) {
     for (int i = 0; i < shell->alias_count; i++) {
         if (strcasecmp(name, shell->aliases[i].name) == 0) return shell->aliases[i].address;
@@ -24,6 +25,19 @@ uint32_t resolve_name(Prime_Shell *shell, const char *name) {
         if (strcasecmp(name, dictionary[i].name) == 0) return dictionary[i].offset;
     }
     return 0xFFFFFFFF;
+}
+
+
+/* Standardized address resolver for the ecosystem */
+uint32_t get_target_address(Prime_Shell *shell, const char *input) {
+    /* 1. Try resolving as an Alias or Register Name first */
+    uint32_t address = resolve_name(shell, input);
+    
+    /* 2. If that fails, parse as a raw number (Hex 0x or Decimal) */
+    if (address == 0xFFFFFFFF) {
+        address = (uint32_t)strtoul(input, NULL, 0);
+    }
+    return address;
 }
 
 
@@ -159,18 +173,18 @@ void cmd_poke(Prime_Shell *shell, int argc, char **argv) {
         return;
     }
     
-    uint32_t address = resolve_name(shell, argv[1]);
-    if (address == 0xFFFFFFFF) address = (uint32_t)strtoul(argv[1], NULL, 16);
-    
-    /* Using Base 0: Autodetects Hex (0x) vs Decimal */
-    uint32_t value = (uint32_t)strtoul(argv[2], NULL, 0);
+    uint32_t address = get_target_address(shell, argv[1]);
+    uint32_t value   = (uint32_t)strtoul(argv[2], NULL, 0);
 
     if (address < 0x200000) {
         shell->bar0[address / 4] = value;
-        printf(COLOR_YELLOW "[WRITE] 0x%08x (%s) -> 0x%08x (Dec: %u)\n" COLOR_RESET, 
-               address, argv[1], value, value);
+        printf(COLOR_YELLOW "[WRITE] 0x%08x (%s) -> 0x%08x\n" COLOR_RESET, 
+               address, argv[1], value);
+    } else {
+        printf(COLOR_RED "[-] Address 0x%08x out of range.\n" COLOR_RESET, address);
     }
 }
+
 
 
 /* -- ALIAS -- */
@@ -252,22 +266,25 @@ void cmd_fill(Prime_Shell *shell, int argc, char **argv) {
         return;
     }
 
-    uint32_t base_address = resolve_name(shell, argv[1]);
-    if (base_address == 0xFFFFFFFF) base_address = (uint32_t)strtoul(argv[1], NULL, 16);
+    uint32_t base_address = get_target_address(shell, argv[1]);
+    uint32_t count = (uint32_t)strtoul(argv[2], NULL, 0);
+    uint32_t step  = (uint32_t)strtoul(argv[3], NULL, 0);
+    uint32_t val   = (uint32_t)strtoul(argv[4], NULL, 0);
 
-    uint32_t iteration_count = (uint32_t)strtoul(argv[2], NULL, 0);
-    uint32_t byte_step       = (uint32_t)strtoul(argv[3], NULL, 0);
-    uint32_t fill_value      = (uint32_t)strtoul(argv[4], NULL, 0);
+    printf(COLOR_CYAN "[*] Burst-filling %u offsets starting at %s (0x%08x)...\n" COLOR_RESET, 
+           count, argv[1], base_address);
 
-    printf(COLOR_CYAN "[*] Burst-firing %u pokes...\n" COLOR_RESET, iteration_count);
-
-    for (uint32_t iteration_index = 0; iteration_index < iteration_count; iteration_index++) {
-        uint32_t current_offset = base_address + (iteration_index * byte_step);
-        if (current_offset < 0x200000) {
-            shell->bar0[current_offset / 4] = fill_value;
-        } else break;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t current_addr = base_address + (i * step);
+        if (current_addr < 0x200000) {
+            shell->bar0[current_addr / 4] = val;
+        } else {
+            printf(COLOR_RED "[-] Abort: 0x%08x exceeds BAR0.\n" COLOR_RESET, current_addr);
+            break;
+        }
     }
 }
+
 
 /* -- SEARCH: Scan for active silicon -- */
 void cmd_search(Prime_Shell *shell, int argc, char **argv) {
@@ -293,10 +310,57 @@ void cmd_search(Prime_Shell *shell, int argc, char **argv) {
     }
 }
 
-/* -- BITS: Binary flag diagnostic -- */
+
+
+/* -- BITS: Unified binary flag diagnostic -- */
 void cmd_bits(Prime_Shell *shell, int argc, char **argv) {
     if (argc < 2) {
         printf(COLOR_RED "[-] Usage: bits <reg/addr>\n" COLOR_RESET);
+        return;
+    }
+
+    /* Resolve address via the unified ecosystem (Alias/Hex/Dec) */
+    uint32_t address = get_target_address(shell, argv[1]);
+
+    if (address >= 0x200000) {
+        printf(COLOR_RED "[-] Error: Address 0x%08x out of range.\n" COLOR_RESET, address);
+        return;
+    }
+
+    /* Read the actual hardware value */
+    uint32_t register_value = shell->bar0[address / 4];
+    
+    printf(COLOR_CYAN "[BITS] 0x%08x (%s): 0x%08x\n" COLOR_RESET, 
+           address, argv[1], register_value);
+
+    printf("Binary: ");
+    for (int bit_index = 31; bit_index >= 0; bit_index--) {
+        /* Extract the specific bit at the current index */
+        uint32_t bit_is_set = (register_value >> bit_index) & 1;
+
+        if (bit_is_set) {
+            /* Highlight active flags in green */
+            printf(COLOR_GREEN "1" COLOR_RESET);
+        } else {
+            printf("0");
+        }
+
+        /* Formatting: Dot every 4 bits, Space every 8 bits for scannability */
+        if (bit_index % 8 == 0 && bit_index != 0) {
+            printf(" ");
+        } else if (bit_index % 4 == 0 && bit_index != 0) {
+            printf(".");
+        }
+    }
+    
+    /* Footer for bit-position reference */
+    printf("\n        ^31      ^24      ^16      ^8       ^0\n");
+}
+
+/* -- MASK: Toggle a specific bit index (0-31) -- */
+void cmd_mask(Prime_Shell *shell, int argc, char **argv) {
+    if (argc < 3) {
+        printf(COLOR_RED "[-] Usage: mask <reg/addr> <bit_index> [0/1]\n" COLOR_RESET);
         return;
     }
 
@@ -305,53 +369,132 @@ void cmd_bits(Prime_Shell *shell, int argc, char **argv) {
         address = (uint32_t)strtoul(argv[1], NULL, 0);
     }
 
-    if (address >= 0x200000) {
-        printf(COLOR_RED "[-] Error: Address 0x%08x out of range.\n" COLOR_RESET, address);
+    int bit_index = atoi(argv[2]);
+    if (bit_index < 0 || bit_index > 31) {
+        printf(COLOR_RED "[-] Error: Bit index must be 0-31.\n" COLOR_RESET);
         return;
     }
 
-    uint32_t current_value = shell->bar0[address / 4];
-    printf(COLOR_CYAN "[BITS] 0x%08x (%s): 0x%08x\n" COLOR_RESET, 
-           address, argv[1], current_value);
+    uint32_t current_val = shell->bar0[address / 4];
+    uint32_t new_val;
 
-    printf("Binary: ");
-    for (int bit_index = 31; bit_index >= 0; bit_index--) {
-        uint32_t bit_is_set = (current_value >> bit_index) & 1;
-        
-        if (bit_is_set) {
-            printf(COLOR_GREEN "1" COLOR_RESET);
+    /* If a third argument is provided (0 or 1), set the bit specifically. 
+       Otherwise, toggle the current state. */
+    if (argc >= 4) {
+        int state = atoi(argv[3]);
+        if (state == 1) {
+            new_val = current_val | (1u << bit_index);
         } else {
-            printf("0");
+            new_val = current_val & ~(1u << bit_index);
         }
+    } else {
+        new_val = current_val ^ (1u << bit_index);
+    }
 
-        /* Formatting: Dot every 4 bits, Space every 8 bits for readability */
-        if (bit_index % 8 == 0 && bit_index != 0) {
-            printf(" ");
-        } else if (bit_index % 4 == 0 && bit_index != 0) {
-            printf(".");
+    shell->bar0[address / 4] = new_val;
+    printf(COLOR_YELLOW "[MASK] 0x%08x (%s) Bit %d updated: 0x%08x -> 0x%08x\n" COLOR_RESET,
+           address, argv[1], bit_index, current_val, new_val);
+}
+
+
+/* -- MACRO --*/ 
+void cmd_macro(Prime_Shell *shell, int argc, char **argv) {
+    if (!shell->recording_active) {
+        /* START RECORDING */
+        shell->recording_active = 1;
+        shell->macro_line_count = 0;
+        printf(COLOR_MAGENTA "[*] Macro recording STARTED. Type 'macro' to stop.\n" COLOR_RESET);
+    } else {
+        /* STOP RECORDING */
+        shell->recording_active = 0;
+        printf(COLOR_MAGENTA "[*] Macro recording STOPPED. (%d lines captured)\n" COLOR_RESET, shell->macro_line_count);
+        if (shell->macro_line_count == 0) return;
+
+        printf("Save as script? (y/n): ");
+        char choice = getchar();
+        getchar(); // Clear newline
+
+        if (choice == 'y' || choice == 'Y') {
+            char filename[64];
+            printf("Enter filename: ");
+            if (fgets(filename, sizeof(filename), stdin)) {
+                filename[strcspn(filename, "\n")] = 0;
+                
+                FILE *file = fopen(filename, "w");
+                if (file) {
+                    fprintf(file, "# Salix Macro Export\n");
+                    for (int i = 0; i < shell->macro_line_count; i++) {
+                        fprintf(file, "%s\n", shell->macro_buffer[i]);
+                    }
+                    fclose(file);
+                    printf(COLOR_GREEN "[+] Saved to %s\n" COLOR_RESET, filename);
+                }
+            }
         }
     }
-    printf("\n        ^31      ^24      ^16      ^8       ^0\n");
+}
+
+
+
+/* -- STEP -- */
+void cmd_step(Prime_Shell *shell, int argc, char **argv) {
+    if (argc < 2) {
+        printf(COLOR_RED "[-] Usage: step <filename>\n" COLOR_RESET);
+        return;
+    }
+
+    FILE *file = fopen(argv[1], "r");
+    if (!file) return;
+
+    char line[256];
+    printf(COLOR_CYAN "[*] Stepping through %s. Press [Enter] for next line, 'q' to abort.\n" COLOR_RESET, argv[1]);
+
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\n")] = 0;
+        if (strlen(line) == 0 || line[0] == '#') continue;
+
+        printf(COLOR_YELLOW "NEXT: %s" COLOR_RESET " (Enter/q) > ", line);
+        char input = getchar();
+        if (input == 'q' || input == 'Q') break;
+        if (input != '\n') getchar(); // Clean up if they typed something before Enter
+
+        shell_execute(shell, line);
+    }
+    fclose(file);
 }
 
 
 /* --- The Command Registry --- */
 const Shell_Command command_table[] = {
-    { "alias",   cmd_alias,      "alias <name> <addr/reg>" },
-    { "bits",    cmd_bits,       "View binary flags: bits <reg/addr>" },
-    { "clear",   cmd_clear,      "Clear terminal" },
-    { "fill",    cmd_fill,       "Burst-fire: fill <addr> <n> <step> <val>" },
-    { "help",    cmd_help,       "Display this menu" },
-    { "log",     cmd_log,        "Sync registers to log" },
-    { "peek",    cmd_peek,       "Read: peek <reg/addr>" },
-    { "poke",    cmd_poke,       "Write: poke <reg/addr> <val>" },
-    { "repeat",  cmd_repeat,     "repeat <n> <cmd>" },
-    { "search",  cmd_search,     "search <start> <end> <mask> <target>" },
-    { "script",  cmd_script,     "Run .prime script" },
-    { "wait",    cmd_wait,       "wait <milliseconds>" },
-    { "until",   cmd_until,      "Poll: until <n> <addr> <mask> <target> <cmd>" },
+    /* Basic Utility */
+    { "help",    cmd_help,       "Display this help menu" },
+    { "clear",   cmd_clear,      "Clear the terminal screen" },
+    { "wait",    cmd_wait,       "Sleep: wait <milliseconds>" },
+    
+    /* System Management & Restoration */
+    { "log",     cmd_log,        "Sync registers to prime_silicon.log" },
+    { "macro",   cmd_macro,      "Record session to script: macro (toggle)" },
+    { "script",  cmd_script,     "Run a .prime script: script <filename>" },
+    { "step",    cmd_step,       "Execute script line-by-line: step <filename>" },
+
+    /* Unified Hardware Interaction (Alias/Hex/Dec aware) */
+    { "alias",   cmd_alias,      "Create shorthand: alias <name> <addr/reg>" },
+    { "bits",    cmd_bits,       "Unified binary flags: bits <reg/addr>" },
+    { "fill",    cmd_fill,       "Unified burst-fill: fill <reg/addr> <n> <step> <val>" },
+    { "mask",    cmd_mask,       "Unified bit toggle: mask <reg/addr> <bit> [0/1]" },
+    { "peek",    cmd_peek,       "Unified read: peek <reg/addr>" },
+    { "poke",    cmd_poke,       "Unified write: poke <reg/addr> <val>" },
+    
+    /* Advanced Automation */
+    { "repeat",  cmd_repeat,     "Repeat a command: repeat <n> <cmd>" },
+    { "search",  cmd_search,     "Unified scan: search <start> <end> <mask> <target>" },
+    { "until",   cmd_until,      "Unified poll: until <n> <addr> <mask> <target> <cmd>" },
+
+    /* Sentinel */
     { NULL,      NULL,           NULL }
 };
+
+
 /* -- HELP -- */
 void cmd_help(Prime_Shell *shell, int argc, char **argv) {
     printf("\n--- Salix Shell Commands ---\n");

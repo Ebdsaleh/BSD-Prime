@@ -10,6 +10,14 @@ extern const Shell_Command command_table[];
 
 
 void shell_execute(Prime_Shell* shell, char* line) {
+    /* 1. CAPTURE FOR MACRO: Save the raw line before tokenization */
+    if (shell->recording_active) {
+        /* Don't record the 'macro' command itself */
+        if (strncasecmp(line, "macro", 5) != 0 && shell->macro_line_count < 128) {
+            strncpy(shell->macro_buffer[shell->macro_line_count++], line, 255);
+        }
+    }
+
     char* argv[16];
     int argc = 0;
     const char *delimiters = " \t\n\r"; /* Define once for consistency */

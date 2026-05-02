@@ -31,6 +31,10 @@ typedef struct {
     /* Alias storage: 64 slots for custom shorthand */
     Alias_Entry aliases[64];
     int alias_count;
+    /* Macro Recording State */
+    int recording_active;
+    char macro_buffer[128][256]; /* Store up to 128 commands */
+    int macro_line_count;
 }Prime_Shell;
 
 
