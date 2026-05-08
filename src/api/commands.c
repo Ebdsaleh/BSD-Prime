@@ -8,7 +8,10 @@
 #include <poll.h>
 #include <termios.h>
 #include <time.h>
-#include "dev/turing_registers.h"
+#include "../dev/turing_registers.h"
+
+#define RANGE_16MB 0x1000000
+#define RANGE_2MB  0x200000
 
 /* Forward declarations for engine-level utility functions */
 extern void shell_execute(Prime_Shell *shell, char *line);
@@ -158,7 +161,7 @@ void cmd_peek(Prime_Shell *shell, int argc, char **argv) {
     uint32_t address = resolve_name(shell, argv[1]);
     if (address == 0xFFFFFFFF) address = (uint32_t)strtoul(argv[1], NULL, 16);
 
-    if (address >= 0x200000) {
+    if (address >= RANGE_16MB) {
         printf(COLOR_RED "[-] Error: Address 0x%08x out of range.\n" COLOR_RESET, address);
         return;
     }
@@ -172,19 +175,29 @@ void cmd_poke(Prime_Shell *shell, int argc, char **argv) {
         printf(COLOR_RED "[-] Usage: poke <reg/addr> <value>\n" COLOR_RESET);
         return;
     }
-    
+
     uint32_t address = get_target_address(shell, argv[1]);
     uint32_t value   = (uint32_t)strtoul(argv[2], NULL, 0);
 
-    if (address < 0x200000) {
+    if (address < RANGE_16MB) {
+        // 1. Perform the physical write
         shell->bar0[address / 4] = value;
-        printf(COLOR_YELLOW "[WRITE] 0x%08x (%s) -> 0x%08x\n" COLOR_RESET, 
-               address, argv[1], value);
+        
+        // 2. Perform an immediate READ-BACK for verification
+        uint32_t verify = shell->bar0[address / 4];
+
+        if (verify == value) {
+            printf(COLOR_YELLOW "[WRITE] 0x%08x (%s) -> 0x%08x (OK)\n" COLOR_RESET,
+                   address, argv[1], value);
+        } else {
+            // This is the feedback you're missing!
+            printf(COLOR_RED "[!] SILICON REJECT: 0x%08x (%s) wrote 0x%08x but reads 0x%08x\n" COLOR_RESET,
+                   address, argv[1], value, verify);
+        }
     } else {
         printf(COLOR_RED "[-] Address 0x%08x out of range.\n" COLOR_RESET, address);
     }
 }
-
 
 
 /* -- ALIAS -- */
@@ -276,7 +289,7 @@ void cmd_fill(Prime_Shell *shell, int argc, char **argv) {
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t current_addr = base_address + (i * step);
-        if (current_addr < 0x200000) {
+        if (current_addr < RANGE_16MB) {
             shell->bar0[current_addr / 4] = val;
         } else {
             printf(COLOR_RED "[-] Abort: 0x%08x exceeds BAR0.\n" COLOR_RESET, current_addr);
@@ -288,20 +301,21 @@ void cmd_fill(Prime_Shell *shell, int argc, char **argv) {
 
 /* -- SEARCH: Scan for active silicon -- */
 void cmd_search(Prime_Shell *shell, int argc, char **argv) {
-    if (argc < 4) {
-        printf(COLOR_RED "[-] Usage: search <start_addr> <end_addr> <mask> <target>\n" COLOR_RESET);
+    /* Correct check: search + start + end + mask + target = 5 total */
+    if (argc < 5) {
+        printf(COLOR_RED "[-] Usage: search <start> <end> <mask> <target>\n" COLOR_RESET);
         return;
     }
 
-    uint32_t start_address = (uint32_t)strtoul(argv[1], NULL, 0);
-    uint32_t end_address   = (uint32_t)strtoul(argv[2], NULL, 0);
+    uint32_t start_address = get_target_address(shell, argv[1]);
+    uint32_t end_address   = get_target_address(shell, argv[2]);
     uint32_t search_mask    = (uint32_t)strtoul(argv[3], NULL, 0);
     uint32_t search_target  = (uint32_t)strtoul(argv[4], NULL, 0);
 
     printf(COLOR_CYAN "[*] Scanning 0x%08x to 0x%08x...\n" COLOR_RESET, start_address, end_address);
 
     for (uint32_t current_offset = start_address; current_offset < end_address; current_offset += 4) {
-        if (current_offset >= 0x200000) break;
+        if (current_offset >= RANGE_16MB) break;
 
         uint32_t read_value = shell->bar0[current_offset / 4];
         if ((read_value & search_mask) == search_target) {
@@ -322,7 +336,7 @@ void cmd_bits(Prime_Shell *shell, int argc, char **argv) {
     /* Resolve address via the unified ecosystem (Alias/Hex/Dec) */
     uint32_t address = get_target_address(shell, argv[1]);
 
-    if (address >= 0x200000) {
+    if (address >= RANGE_16MB) {
         printf(COLOR_RED "[-] Error: Address 0x%08x out of range.\n" COLOR_RESET, address);
         return;
     }

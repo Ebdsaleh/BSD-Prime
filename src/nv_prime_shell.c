@@ -102,7 +102,11 @@ void print_menu() {
 }
 
 int main() {
-    uint32_t *gpu_bar0 = (uint32_t *)map_physical_memory(0xAD000000, 0x200000);
+    /* Map 16MB instead of 2MB to reach the 0x400000 range 
+     *  was 0x200000 before.
+     *  */
+    uint32_t *gpu_bar0 = (uint32_t *)map_physical_memory(0xAD000000, 0x1000000);
+          
     if (!gpu_bar0) return 1;
 
     Prime_Shell shell;
